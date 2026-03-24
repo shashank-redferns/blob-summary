@@ -40,7 +40,7 @@ def blob_summarizer(event: func.EventGridEvent) -> None:
         logger.info("Processing blob: %s", blob_url)
 
         # ── 2. Read blob metadata (contains Salesforce recordId) ─────────
-        conn_str = os.environ["AzureWebJobsStorage"]
+        conn_str = os.environ["BLOB_STORAGE_CONNECTION"]
         # Parse container & blob name from URL
         parsed = urlparse(blob_url)
         path_parts = parsed.path.lstrip("/").split("/", 1)
@@ -135,28 +135,58 @@ def _summarise_document(client: OpenAI, deployment: str, full_text: str) -> str:
     return _summarise(client, deployment, combined)
 
 
+def _get_salesforce_token() -> str:
+    """
+    Exchange the stored refresh token for a fresh Salesforce access token.
+    Uses the OAuth2 refresh-token grant with the Connected App credentials.
+
+    Required env vars:
+        SF_AUTH_URL       – e.g. https://login.salesforce.com  (or a My Domain URL)
+        SF_CONSUMER_KEY   – Connected App client_id
+        SF_CONSUMER_SECRET– Connected App client_secret
+        SF_REFRESH_TOKEN  – Long-lived refresh token
+    """
+    auth_url = os.environ["SF_AUTH_URL"].rstrip("/") + "/services/oauth2/token"
+    resp = requests.post(
+        auth_url,
+        data={
+            "grant_type": "refresh_token",
+            "client_id": os.environ["SF_CONSUMER_KEY"],
+            "client_secret": os.environ["SF_CONSUMER_SECRET"],
+            "refresh_token": os.environ["SF_REFRESH_TOKEN"],
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    token = resp.json()["access_token"]
+    logger.info("Salesforce access token refreshed successfully")
+    return token
+
+
 def _call_salesforce(record_id: str, summary: str, page_count: int, doc_url: str) -> None:
     """
-    POST to a custom Salesforce Apex REST service.
-    The Apex class should be exposed at:
-        @RestResource(urlMapping='/BlobSummary/*')
-    and accept: recordId, summary, pageCount, docUrl, status
+    POST to the authenticated Salesforce Apex REST endpoint.
+    Endpoint: POST {SALESFORCE_BASE_URL}/services/apexrest/UpdateDocumentSummary/
+    Payload:  { "fileName": "...", "summary": "...", "noOfPages": <int> }
     """
     base_url = os.environ["SALESFORCE_BASE_URL"].rstrip("/")
-    apex_class = os.environ.get("SALESFORCE_APEX_CLASS", "BlobSummary")
-    url = f"{base_url}/services/apexrest/{apex_class}/"
+    url = f"{base_url}/services/apexrest/UpdateDocumentSummary/"
+
+    # Extract filename from the blob URL
+    file_name = doc_url.split("/")[-1]
+
+    access_token = _get_salesforce_token()
+
     payload = {
-        "recordId": record_id,
+        "fileName": file_name,
         "summary": summary,
-        "pageCount": page_count,
-        "docUrl": doc_url,
-        "status": "Completed",
+        "noOfPages": page_count,
     }
-    logger.info("Calling Salesforce Apex REST: %s | payload keys: %s", url, list(payload.keys()))
+    logger.info("Calling Salesforce: %s | file=%s pages=%d", url, file_name, page_count)
     response = requests.post(
         url,
         headers={
-            "Authorization": f"Bearer {os.environ['SALESFORCE_TOKEN']}",
+            "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         },
         json=payload,
@@ -171,12 +201,13 @@ def _report_failure_to_salesforce(record_id: Optional[str], exc: Exception) -> N
     if not record_id:
         return
     try:
+        access_token = _get_salesforce_token()
         base_url = os.environ["SALESFORCE_BASE_URL"]
         url = f"{base_url}/services/data/v59.0/sobjects/Document__c/{record_id}"
         requests.patch(
             url,
             headers={
-                "Authorization": f"Bearer {os.environ['SALESFORCE_TOKEN']}",
+                "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
             },
             json={"Status__c": "Failed", "Error__c": str(exc)},
@@ -219,7 +250,7 @@ def merge_pdfs(req: func.HttpRequest) -> func.HttpResponse:
             "Both 'blob_url_1' and 'blob_url_2' are required.", status_code=400
         )
 
-    conn_str = os.environ["AzureWebJobsStorage"]
+    conn_str = os.environ["BLOB_STORAGE_CONNECTION"]
 
     def _download(blob_url: str) -> bytes:
         from urllib.parse import unquote
