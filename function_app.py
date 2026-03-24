@@ -73,7 +73,15 @@ def blob_summarizer(event: func.EventGridEvent) -> None:
         result = poller.result()
 
         full_text: str = result.content or ""
-        page_count: int = len(result.pages)
+
+        # Count pages from the actual PDF structure (more accurate than Document Intelligence's OCR-based count)
+        try:
+            pdf_reader = PdfReader(io.BytesIO(blob_data))
+            page_count = len(pdf_reader.pages)
+        except Exception:
+            # Fall back to Document Intelligence count for non-PDF files
+            page_count = len(result.pages)
+
         logger.info("Extracted %d chars across %d pages", len(full_text), page_count)
 
         if not full_text.strip():
