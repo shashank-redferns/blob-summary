@@ -1,0 +1,13 @@
+# Exclude files that don't need to be deployed to Azure
+.git
+.venv
+.env
+__pycache__
+.pytest_cache
+*.pyc
+*.pyo
+local.settings.json
+.vscode
+.idea
+tests/
+*.md
