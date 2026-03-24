@@ -8,8 +8,9 @@ import azure.functions as func
 import requests
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
-from azure.storage.blob import BlobClient
+from azure.storage.blob import BlobClient, BlobServiceClient
 from openai import OpenAI
+from pypdf import PdfWriter, PdfReader
 
 # ──────────────────────────────────────────────
 # Config
@@ -183,3 +184,95 @@ def _report_failure_to_salesforce(record_id: Optional[str], exc: Exception) -> N
         )
     except Exception as inner:
         logger.error("Could not report failure to Salesforce: %s", inner)
+
+
+# ──────────────────────────────────────────────
+# PDF Merge Function
+# ──────────────────────────────────────────────
+@app.route(route="merge-pdfs", methods=["POST"])
+def merge_pdfs(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Merges two PDF blobs into one and uploads the result back to Azure Blob Storage.
+
+    Expected JSON body:
+    {
+        "blob_url_1": "https://redfernstech.blob.core.windows.net/cases/path/to/file1.pdf",
+        "blob_url_2": "https://redfernstech.blob.core.windows.net/cases/path/to/file2.pdf",
+        "output_name": "merged_output.pdf"   // optional
+    }
+
+    Returns JSON:
+    {
+        "merged_url": "https://...",
+        "pages": <total page count>
+    }
+    """
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON body", status_code=400)
+
+    blob_url_1 = body.get("blob_url_1")
+    blob_url_2 = body.get("blob_url_2")
+    if not blob_url_1 or not blob_url_2:
+        return func.HttpResponse(
+            "Both 'blob_url_1' and 'blob_url_2' are required.", status_code=400
+        )
+
+    conn_str = os.environ["AzureWebJobsStorage"]
+
+    def _download(blob_url: str) -> bytes:
+        from urllib.parse import unquote
+        parsed = urlparse(blob_url)
+        parts = parsed.path.lstrip("/").split("/", 1)
+        container = parts[0]
+        blob_name = unquote(parts[1]) if len(parts) > 1 else ""
+        client = BlobClient.from_connection_string(conn_str, container, blob_name)
+        return client.download_blob().readall()
+
+    logger.info("Downloading blob 1: %s", blob_url_1)
+    data1 = _download(blob_url_1)
+    logger.info("Downloading blob 2: %s", blob_url_2)
+    data2 = _download(blob_url_2)
+
+    # ── Merge with pypdf ──────────────────────────────────────────────────
+    writer = PdfWriter()
+    for data in (data1, data2):
+        reader = PdfReader(io.BytesIO(data))
+        for page in reader.pages:
+            writer.add_page(page)
+
+    merged_buffer = io.BytesIO()
+    writer.write(merged_buffer)
+    merged_buffer.seek(0)
+    total_pages = len(writer.pages)
+    logger.info("Merged PDF has %d pages", total_pages)
+
+    # ── Upload merged PDF into the same virtual directory as blob 1 ──────
+    # Structure: {container}/{case_folder}/{subfolder}/{file}
+    # Merged goes to: {container}/{case_folder}/merged/{output_name}
+    parsed1 = urlparse(blob_url_1)
+    parts1 = parsed1.path.lstrip("/").split("/", 1)
+    container_name = parts1[0]
+    blob1_path = parts1[1] if len(parts1) > 1 else ""
+    # Extract the top-level virtual directory (case folder) — first path segment
+    case_folder = blob1_path.split("/")[0] if "/" in blob1_path else ""
+    original_name = blob1_path.split("/")[-1] or "file1.pdf"
+    output_filename = body.get("output_name") or f"merged_{original_name}"
+    # Place under {case_folder}/merged/
+    output_blob_path = f"{case_folder}/merged/{output_filename}" if case_folder else f"merged/{output_filename}"
+
+    svc = BlobServiceClient.from_connection_string(conn_str)
+    upload_client = svc.get_blob_client(container=container_name, blob=output_blob_path)
+    upload_client.upload_blob(merged_buffer, overwrite=True, content_settings=None)
+
+    account_name = upload_client.account_name
+    merged_url = f"https://{account_name}.blob.core.windows.net/{container_name}/{output_blob_path}"
+    logger.info("Merged PDF uploaded: %s", merged_url)
+
+    import json
+    return func.HttpResponse(
+        json.dumps({"merged_url": merged_url, "pages": total_pages}),
+        mimetype="application/json",
+        status_code=200,
+    )

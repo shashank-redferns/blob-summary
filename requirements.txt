@@ -4,3 +4,4 @@ azure-ai-documentintelligence==1.0.0
 azure-core==1.32.0
 openai==1.57.2
 requests==2.32.3
+pypdf==4.3.1
