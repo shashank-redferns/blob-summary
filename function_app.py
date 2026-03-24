@@ -166,14 +166,13 @@ def _get_salesforce_token() -> str:
 def _call_salesforce(record_id: str, summary: str, page_count: int, doc_url: str) -> None:
     """
     POST to the authenticated Salesforce Apex REST endpoint.
-    Endpoint: POST {SALESFORCE_BASE_URL}/services/apexrest/UpdateDocumentSummary/
+    Endpoint: SF_APEX_URL  (e.g. https://oraclecorp3.my.salesforce-sites.com/AzureAiSummary/services/apexrest/UpdateDocumentSummary)
     Payload:  { "fileName": "...", "summary": "...", "noOfPages": <int> }
 
     fileName is the full blob path within the container, e.g.:
         00001029_500f6000009QXdJAAW/merged/March.pdf
     """
-    base_url = os.environ["SALESFORCE_BASE_URL"].rstrip("/")
-    url = f"{base_url}/services/apexrest/UpdateDocumentSummary/"
+    url = os.environ["SF_APEX_URL"].rstrip("/")
 
     # Extract the blob path after the container name from the URL.
     # URL format: https://<account>.blob.core.windows.net/<container>/<blob-path>
